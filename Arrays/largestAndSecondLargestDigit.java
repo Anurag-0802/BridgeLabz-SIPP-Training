@@ -9,6 +9,7 @@ public class largestAndSecondLargestDigit {
 
         int maxDigit = 10;
         int[] digits = new int[maxDigit];
+        
         int index = 0;
         int tempNumber = number;
         while (tempNumber != 0 && index < maxDigit) {
@@ -20,8 +21,8 @@ public class largestAndSecondLargestDigit {
             System.out.println("No digits to process.");
             return;
         }
-        int largest = -1;
-        int secondLargest = -1;
+        int largest = Integer.MIN_VALUE;
+        int secondLargest = Integer.MIN_VALUE;
         for (int i = 0; i < index; i++) {
             if (digits[i] > largest) {
                 secondLargest = largest;
