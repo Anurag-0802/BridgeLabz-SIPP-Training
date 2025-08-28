@@ -1,0 +1,515 @@
+import os
+import json
+import numpy as np
+from typing import List, Dict, Any
+from dataclasses import dataclass, asdict
+import streamlit as st
+from sentence_transformers import SentenceTransformer
+import faiss
+import PyPDF2
+from docx import Document
+import openai
+from datetime import datetime
+import pickle
+
+# Configuration
+@dataclass
+class Config:
+    embedding_model_name: str = "all-MiniLM-L6-v2"
+    chunk_size: int = 500
+    chunk_overlap: int = 50
+    top_k_retrieval: int = 3
+    vector_db_path: str = "vector_store.pkl"
+    documents_path: str = "documents_metadata.json"
+    openai_api_key: str = ""  # Set your OpenAI API key here
+
+@dataclass
+class Document:
+    id: str
+    name: str
+    content: str
+    upload_date: str
+    file_type: str
+    chunk_count: int
+
+@dataclass
+class TextChunk:
+    id: str
+    document_id: str
+    text: str
+    chunk_index: int
+    embedding: np.ndarray = None
+
+class DocumentProcessor:
+    """Handles document loading and text extraction"""
+    
+    @staticmethod
+    def extract_text_from_pdf(file_path: str) -> str:
+        """Extract text from PDF file"""
+        text = ""
+        try:
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
+        except Exception as e:
+            st.error(f"Error reading PDF: {e}")
+        return text
+    
+    @staticmethod
+    def extract_text_from_docx(file_path: str) -> str:
+        """Extract text from DOCX file"""
+        text = ""
+        try:
+            doc = Document(file_path)
+            for paragraph in doc.paragraphs:
+                text += paragraph.text + "\n"
+        except Exception as e:
+            st.error(f"Error reading DOCX: {e}")
+        return text
+    
+    @staticmethod
+    def extract_text_from_txt(file_path: str) -> str:
+        """Extract text from TXT file"""
+        text = ""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                text = file.read()
+        except Exception as e:
+            st.error(f"Error reading TXT: {e}")
+        return text
+    
+    def process_document(self, file_path: str, file_name: str) -> Document:
+        """Process document and extract text based on file type"""
+        file_type = file_name.split('.')[-1].lower()
+        
+        if file_type == 'pdf':
+            content = self.extract_text_from_pdf(file_path)
+        elif file_type == 'docx':
+            content = self.extract_text_from_docx(file_path)
+        elif file_type == 'txt':
+            content = self.extract_text_from_txt(file_path)
+        else:
+            raise ValueError(f"Unsupported file type: {file_type}")
+        
+        doc_id = f"{file_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        return Document(
+            id=doc_id,
+            name=file_name,
+            content=content,
+            upload_date=datetime.now().isoformat(),
+            file_type=file_type,
+            chunk_count=0  # Will be updated after chunking
+        )
+
+class TextChunker:
+    """Handles text chunking with overlap"""
+    
+    def __init__(self, chunk_size: int = 500, overlap: int = 50):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+    
+    def chunk_text(self, text: str, document_id: str) -> List[TextChunk]:
+        """Split text into chunks with overlap"""
+        words = text.split()
+        chunks = []
+        
+        for i in range(0, len(words), self.chunk_size - self.overlap):
+            chunk_words = words[i:i + self.chunk_size]
+            chunk_text = ' '.join(chunk_words)
+            
+            if len(chunk_text.strip()) > 0:
+                chunk = TextChunk(
+                    id=f"{document_id}_chunk_{len(chunks)}",
+                    document_id=document_id,
+                    text=chunk_text.strip(),
+                    chunk_index=len(chunks)
+                )
+                chunks.append(chunk)
+        
+        return chunks
+
+class VectorStore:
+    """Handles vector storage and similarity search using FAISS"""
+    
+    def __init__(self, embedding_model_name: str):
+        self.model = SentenceTransformer(embedding_model_name)
+        self.index = None
+        self.chunks = []
+        self.dimension = None
+    
+    def add_chunks(self, chunks: List[TextChunk]):
+        """Add text chunks to the vector store"""
+        if not chunks:
+            return
+        
+        # Generate embeddings
+        texts = [chunk.text for chunk in chunks]
+        embeddings = self.model.encode(texts)
+        
+        # Initialize FAISS index if not exists
+        if self.index is None:
+            self.dimension = embeddings.shape[1]
+            self.index = faiss.IndexFlatIP(self.dimension)  # Inner product for cosine similarity
+        
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(embeddings)
+        
+        # Add embeddings to chunks
+        for chunk, embedding in zip(chunks, embeddings):
+            chunk.embedding = embedding
+        
+        # Add to FAISS index
+        self.index.add(embeddings.astype('float32'))
+        self.chunks.extend(chunks)
+    
+    def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """Search for similar chunks"""
+        if self.index is None or len(self.chunks) == 0:
+            return []
+        
+        # Generate query embedding
+        query_embedding = self.model.encode([query])
+        faiss.normalize_L2(query_embedding)
+        
+        # Search
+        scores, indices = self.index.search(query_embedding.astype('float32'), top_k)
+        
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < len(self.chunks):
+                results.append({
+                    'chunk': self.chunks[idx],
+                    'similarity_score': float(score),
+                    'text': self.chunks[idx].text
+                })
+        
+        return results
+    
+    def save(self, file_path: str):
+        """Save vector store to disk"""
+        data = {
+            'chunks': [asdict(chunk) for chunk in self.chunks],
+            'dimension': self.dimension
+        }
+        
+        with open(file_path, 'wb') as f:
+            pickle.dump(data, f)
+        
+        if self.index is not None:
+            faiss.write_index(self.index, file_path.replace('.pkl', '.faiss'))
+    
+    def load(self, file_path: str):
+        """Load vector store from disk"""
+        try:
+            with open(file_path, 'rb') as f:
+                data = pickle.load(f)
+            
+            self.chunks = [TextChunk(**chunk_data) for chunk_data in data['chunks']]
+            self.dimension = data['dimension']
+            
+            faiss_path = file_path.replace('.pkl', '.faiss')
+            if os.path.exists(faiss_path):
+                self.index = faiss.read_index(faiss_path)
+            
+            return True
+        except FileNotFoundError:
+            return False
+
+class AnswerGenerator:
+    """Generates answers using retrieved context"""
+    
+    def __init__(self, api_key: str = None):
+        if api_key:
+            openai.api_key = api_key
+            self.use_openai = True
+        else:
+            self.use_openai = False
+    
+    def generate_answer_openai(self, question: str, context_chunks: List[Dict]) -> str:
+        """Generate answer using OpenAI GPT"""
+        context = "\n\n".join([chunk['text'] for chunk in context_chunks])
+        
+        prompt = f"""
+        Based on the following context from uploaded documents, answer the question. 
+        If the answer cannot be found in the context, say so clearly.
+        
+        Context:
+        {context}
+        
+        Question: {question}
+        
+        Answer:
+        """
+        
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that answers questions based on provided context."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=500,
+                temperature=0.1
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return f"Error generating answer with OpenAI: {e}"
+    
+    def generate_answer_simple(self, question: str, context_chunks: List[Dict]) -> str:
+        """Generate simple answer using keyword matching"""
+        if not context_chunks:
+            return "I couldn't find relevant information in the uploaded documents."
+        
+        # Combine context
+        context = " ".join([chunk['text'] for chunk in context_chunks])
+        
+        # Simple extractive approach - find sentences containing question keywords
+        question_words = set(question.lower().split())
+        sentences = context.split('.')
+        
+        relevant_sentences = []
+        for sentence in sentences:
+            sentence_words = set(sentence.lower().split())
+            overlap = len(question_words & sentence_words)
+            if overlap > 0:
+                relevant_sentences.append((sentence.strip(), overlap))
+        
+        if relevant_sentences:
+            # Sort by overlap and take top sentences
+            relevant_sentences.sort(key=lambda x: x[1], reverse=True)
+            answer = ". ".join([sent[0] for sent in relevant_sentences[:3]])
+            return f"Based on the documents: {answer}"
+        else:
+            return "I found related content but couldn't extract a specific answer to your question."
+    
+    def generate_answer(self, question: str, context_chunks: List[Dict]) -> str:
+        """Generate answer using available method"""
+        if self.use_openai:
+            return self.generate_answer_openai(question, context_chunks)
+        else:
+            return self.generate_answer_simple(question, context_chunks)
+
+class DocumentQASystem:
+    """Main RAG system that coordinates all components"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.processor = DocumentProcessor()
+        self.chunker = TextChunker(config.chunk_size, config.chunk_overlap)
+        self.vector_store = VectorStore(config.embedding_model_name)
+        self.answer_generator = AnswerGenerator(config.openai_api_key)
+        self.documents = []
+        
+        # Load existing data
+        self.load_system_state()
+    
+    def add_document(self, file_path: str, file_name: str):
+        """Add a document to the system"""
+        # Process document
+        document = self.processor.process_document(file_path, file_name)
+        
+        # Chunk text
+        chunks = self.chunker.chunk_text(document.content, document.id)
+        document.chunk_count = len(chunks)
+        
+        # Add to vector store
+        self.vector_store.add_chunks(chunks)
+        
+        # Add to documents list
+        self.documents.append(document)
+        
+        # Save system state
+        self.save_system_state()
+        
+        return document
+    
+    def ask_question(self, question: str) -> Dict[str, Any]:
+        """Process a question and return answer with metadata"""
+        # Retrieve relevant chunks
+        search_results = self.vector_store.search(question, self.config.top_k_retrieval)
+        
+        # Generate answer
+        answer = self.answer_generator.generate_answer(question, search_results)
+        
+        return {
+            'question': question,
+            'answer': answer,
+            'retrieved_chunks': len(search_results),
+            'sources': [result['chunk'].document_id for result in search_results],
+            'similarity_scores': [result['similarity_score'] for result in search_results],
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    def get_documents(self) -> List[Document]:
+        """Get all documents in the system"""
+        return self.documents
+    
+    def remove_document(self, document_id: str):
+        """Remove a document from the system"""
+        # Remove from documents list
+        self.documents = [doc for doc in self.documents if doc.id != document_id]
+        
+        # Remove chunks from vector store (requires rebuilding)
+        remaining_chunks = [chunk for chunk in self.vector_store.chunks if chunk.document_id != document_id]
+        
+        # Rebuild vector store
+        self.vector_store = VectorStore(self.config.embedding_model_name)
+        if remaining_chunks:
+            self.vector_store.add_chunks(remaining_chunks)
+        
+        self.save_system_state()
+    
+    def save_system_state(self):
+        """Save system state to disk"""
+        # Save documents metadata
+        with open(self.config.documents_path, 'w') as f:
+            json.dump([asdict(doc) for doc in self.documents], f, indent=2)
+        
+        # Save vector store
+        self.vector_store.save(self.config.vector_db_path)
+    
+    def load_system_state(self):
+        """Load system state from disk"""
+        # Load documents metadata
+        try:
+            with open(self.config.documents_path, 'r') as f:
+                docs_data = json.load(f)
+                self.documents = [Document(**doc_data) for doc_data in docs_data]
+        except FileNotFoundError:
+            self.documents = []
+        
+        # Load vector store
+        self.vector_store.load(self.config.vector_db_path)
+
+# Streamlit UI
+def main():
+    st.set_page_config(page_title="Document Q&A RAG System", page_icon="📚", layout="wide")
+    
+    st.title("📚 Document Q&A RAG System")
+    st.markdown("Upload documents and ask questions about their content using Retrieval-Augmented Generation")
+    
+    # Initialize system
+    config = Config()
+    
+    if 'qa_system' not in st.session_state:
+        with st.spinner("Initializing system..."):
+            st.session_state.qa_system = DocumentQASystem(config)
+    
+    qa_system = st.session_state.qa_system
+    
+    # Sidebar for document management
+    with st.sidebar:
+        st.header("📄 Document Management")
+        
+        # File upload
+        uploaded_files = st.file_uploader(
+            "Upload Documents",
+            accept_multiple_files=True,
+            type=['pdf', 'docx', 'txt'],
+            help="Supported formats: PDF, DOCX, TXT"
+        )
+        
+        if uploaded_files:
+            for uploaded_file in uploaded_files:
+                # Save temporary file
+                temp_path = f"temp_{uploaded_file.name}"
+                with open(temp_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                
+                try:
+                    with st.spinner(f"Processing {uploaded_file.name}..."):
+                        document = qa_system.add_document(temp_path, uploaded_file.name)
+                        st.success(f"Added {uploaded_file.name} ({document.chunk_count} chunks)")
+                except Exception as e:
+                    st.error(f"Error processing {uploaded_file.name}: {e}")
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+        
+        # Display current documents
+        st.subheader("Current Documents")
+        documents = qa_system.get_documents()
+        
+        if documents:
+            for doc in documents:
+                with st.expander(f"📄 {doc.name}"):
+                    st.write(f"**Type:** {doc.file_type.upper()}")
+                    st.write(f"**Chunks:** {doc.chunk_count}")
+                    st.write(f"**Uploaded:** {doc.upload_date[:10]}")
+                    
+                    if st.button(f"Remove {doc.name}", key=f"remove_{doc.id}"):
+                        qa_system.remove_document(doc.id)
+                        st.rerun()
+        else:
+            st.info("No documents uploaded yet")
+    
+    # Main area for Q&A
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.header("💬 Ask Questions")
+        
+        # Question input
+        question = st.text_input(
+            "Enter your question:",
+            placeholder="What is this document about?",
+            help="Ask questions about the content of your uploaded documents"
+        )
+        
+        if st.button("Get Answer", type="primary") and question:
+            if not documents:
+                st.warning("Please upload at least one document first!")
+            else:
+                with st.spinner("Searching and generating answer..."):
+                    result = qa_system.ask_question(question)
+                
+                # Display answer
+                st.subheader("Answer:")
+                st.write(result['answer'])
+                
+                # Display metadata
+                with st.expander("View Details"):
+                    st.write(f"**Retrieved Chunks:** {result['retrieved_chunks']}")
+                    st.write(f"**Source Documents:** {', '.join(set(result['sources']))}")
+                    if result['similarity_scores']:
+                        avg_score = sum(result['similarity_scores']) / len(result['similarity_scores'])
+                        st.write(f"**Average Similarity Score:** {avg_score:.3f}")
+    
+    with col2:
+        st.header("📊 System Stats")
+        
+        if documents:
+            total_docs = len(documents)
+            total_chunks = sum(doc.chunk_count for doc in documents)
+            
+            st.metric("Total Documents", total_docs)
+            st.metric("Total Chunks", total_chunks)
+            st.metric("Average Chunks per Doc", f"{total_chunks/total_docs:.1f}")
+            
+            # Document types breakdown
+            doc_types = {}
+            for doc in documents:
+                doc_types[doc.file_type] = doc_types.get(doc.file_type, 0) + 1
+            
+            st.subheader("Document Types")
+            for doc_type, count in doc_types.items():
+                st.write(f"**{doc_type.upper()}:** {count}")
+        else:
+            st.info("Upload documents to see statistics")
+
+if __name__ == "__main__":
+    main()
+
+# Requirements.txt content:
+"""
+streamlit
+sentence-transformers
+faiss-cpu
+PyPDF2
+python-docx
+openai
+numpy
+"""
