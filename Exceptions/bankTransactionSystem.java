@@ -4,7 +4,7 @@ class InsufficientBalanceException extends Exception {
     }
 }
 
-class bankTransactionSystem {
+class BankAccount {
     double balance = 1000;
 
     public void withdraw(double amount) throws InsufficientBalanceException {
@@ -21,7 +21,7 @@ class bankTransactionSystem {
 
 public class bankTransactionSystem {
     public static void main(String[] args) {
-        bankTransactionSystem account = new bankTransactionSystem();
+        BankAccount account = new BankAccount();
 
         try {
             account.withdraw(1500);
